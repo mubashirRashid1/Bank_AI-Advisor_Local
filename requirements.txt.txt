@@ -1,0 +1,16 @@
+snowflake-connector-python
+streamlit
+pandas
+python-dotenv
+requests
+plotly
+yfinance
+newsapi-python
+tavily-python
+langgraph
+langchain
+langchain-core
+sqlalchemy
+snowflake-sqlalchemy
+openpyxl
+uuid
