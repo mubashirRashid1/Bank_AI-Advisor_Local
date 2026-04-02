@@ -1,16 +1,26 @@
-snowflake-connector-python
+# ── Web framework ─────────────────────────────────────────────────
 streamlit
+
+# ── Data ──────────────────────────────────────────────────────────
 pandas
-python-dotenv
-requests
 plotly
 yfinance
-newsapi-python
-tavily-python
+
+# ── AI / ML ───────────────────────────────────────────────────────
+sentence-transformers
+chromadb
+ollama
+
+# ── Agent framework ───────────────────────────────────────────────
 langgraph
 langchain
 langchain-core
-sqlalchemy
-snowflake-sqlalchemy
-openpyxl
+
+# ── Data sources ──────────────────────────────────────────────────
+newsapi-python
+tavily-python
+requests
+
+# ── Utilities ─────────────────────────────────────────────────────
+python-dotenv
 uuid
