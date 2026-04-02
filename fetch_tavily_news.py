@@ -1,109 +1,101 @@
-from tavily import TavilyClient
-import snowflake.connector
+# ── fetch_tavily_news.py — SQLite version ────────────────────────
+import requests
+import uuid
+import json
+from datetime import datetime
 from dotenv import load_dotenv
 import os
-from datetime import datetime
-import uuid
+from db import get_connection, run_execute
 
 load_dotenv()
 
-# ── Canadian banking & finance search queries ──────────────────────
-SEARCH_QUERIES = [
-    "Canadian bank interest rates news today",
-    "TSX stock market Canada today",
-    "Bank of Canada monetary policy news",
-    "Canadian portfolio investment news today",
-    "Canada inflation economy news today",
-    "RBC TD BMO CIBC Scotiabank news today",
-    "Canadian bond market news today",
-    "Canada housing market mortgage rates news"
+TAVILY_API_KEY = os.getenv('TAVILY_API_KEY')
+
+QUERIES = [
+    "Canadian bank wealth management news today",
+    "Bank of Canada monetary policy 2026",
+    "TSX stock market Canadian equities today",
+    "Canadian real estate investment 2026",
+    "OSFI Canadian banking regulation",
 ]
 
-def get_snowflake_connection():
-    return snowflake.connector.connect(
-        account=os.getenv('SNOWFLAKE_ACCOUNT'),
-        user=os.getenv('SNOWFLAKE_USER'),
-        password=os.getenv('SNOWFLAKE_PASSWORD'),
-        database=os.getenv('SNOWFLAKE_DATABASE'),
-        schema=os.getenv('SNOWFLAKE_SCHEMA'),
-        warehouse=os.getenv('SNOWFLAKE_WAREHOUSE')
-    )
-
 def fetch_and_store_news():
-    print("🔍 Fetching financial news from Tavily...\n")
+    print("Fetching news from Tavily...")
 
-    tavily  = TavilyClient(api_key=os.getenv('TAVILY_API_KEY'))
-    conn    = get_snowflake_connection()
-    cursor  = conn.cursor()
+    if not TAVILY_API_KEY:
+        print("   WARNING: TAVILY_API_KEY not set — skipping")
+        return 0
 
-    # ── Make sure these are initialized BEFORE the loop ───────────
-    total_stored  = 0
-    total_skipped = 0
+    saved   = 0
+    skipped = 0
 
-    for query in SEARCH_QUERIES:
+    for query in QUERIES:
         try:
-            print(f"  🔎 Searching: '{query}'")
-            response = tavily.search(
-                query=query,
-                search_depth="advanced",
-                max_results=5,
-                include_answer=True
+            response = requests.post(
+                "https://api.tavily.com/search",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "api_key":        TAVILY_API_KEY,
+                    "query":          query,
+                    "search_depth":   "basic",
+                    "max_results":    5,
+                    "include_answer": False
+                },
+                timeout=30
             )
+            response.raise_for_status()
+            articles = response.json().get('results', [])
 
-            results = response.get('results', [])
+            for article in articles:
+                if not article or not isinstance(article, dict):
+                    continue
 
-            for article in results:
-                news_id     = str(uuid.uuid4())
-                title       = article.get('title', '')[:1000]
-                content     = article.get('content', '')
-                url         = article.get('url', '')[:2000]
-                published   = article.get('published_date', None)
-                source      = extract_source(url)
+                title   = str(article.get('title',   '') or '')
+                content = str(article.get('content', '') or '')
+                url     = str(article.get('url',     '') or '')
+                source  = url.split('/')[2].replace('www.','') \
+                          if url else 'tavily'
 
-                published_at = None
-                if published:
-                    try:
-                        published_at = datetime.strptime(published, '%Y-%m-%dT%H:%M:%SZ')
-                    except:
-                        published_at = datetime.now()
-                else:
-                    published_at = datetime.now()
+                if not title or not url:
+                    continue
 
-                cursor.execute("""
-                    SELECT COUNT(*) FROM NEWS_RAW WHERE URL = %s
-                """, (url,))
+                # Check duplicate
+                conn   = get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM NEWS_RAW WHERE URL = ?",
+                    (url,)
+                )
+                exists = cursor.fetchone()[0]
+                cursor.close()
+                conn.close()
 
-                if cursor.fetchone()[0] == 0:
-                    cursor.execute("""
-                        INSERT INTO NEWS_RAW
-                            (ID, SOURCE, TITLE, CONTENT, URL, PUBLISHED_AT)
-                        VALUES
-                            (%s, %s, %s, %s, %s, %s)
-                    """, (news_id, source, title, content, url, published_at))
-                    print(f"    ✅ Stored : {title[:70]}...")
-                    total_stored += 1
-                else:
-                    print(f"    ⏭️  Skipped (already exists): {title[:70]}...")
-                    total_skipped += 1
+                if exists:
+                    skipped += 1
+                    continue
+
+                # Save raw article only — enrichment done separately
+                run_execute("""
+                    INSERT INTO NEWS_RAW
+                        (ID, SOURCE, TITLE, CONTENT,
+                         URL, PUBLISHED_AT)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    str(uuid.uuid4()),
+                    source[:100],
+                    title[:1000],
+                    content,
+                    url[:2000],
+                    datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+                ))
+                saved += 1
+                print(f"   Saved: {title[:70]}...")
 
         except Exception as e:
-            print(f"    ❌ Failed for query '{query}': {str(e)}")
-            continue   # ← add this so loop keeps going after error
+            print(f"   Error fetching '{query}': {e}")
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"\n🎉 Done! {total_stored} stored, {total_skipped} skipped.")
-    
-def extract_source(url):
-    """Extract domain name as source from URL"""
-    try:
-        domain = url.split('/')[2]
-        domain = domain.replace('www.', '')
-        return domain[:100]
-    except:
-        return 'Unknown'
+    print(f"\n   Tavily: {saved} saved, {skipped} skipped")
+    return saved
 
 if __name__ == "__main__":
     fetch_and_store_news()

@@ -1,85 +1,107 @@
+# ── fetch_market_prices.py — SQLite version ───────────────────────
 import yfinance as yf
-import snowflake.connector
-from dotenv import load_dotenv
-import os
-from datetime import date
 import uuid
+from datetime import date
+from db import get_connection, run_execute
 
-load_dotenv()
-
-# ── Canadian bank & TSX tickers to track ──────────────────────────
-TICKERS = {
-    'RY.TO':    'Royal Bank of Canada',
-    'TD.TO':    'Toronto Dominion Bank',
-    'BNS.TO':   'Bank of Nova Scotia',
-    'BMO.TO':   'Bank of Montreal',
-    'CM.TO':    'CIBC',
-    'SU.TO':    'Suncor Energy',
-    'SHOP.TO':  'Shopify Inc',
-    'CNR.TO':   'Canadian National Railway',
-    'ENB.TO':   'Enbridge Inc',
-    'BCE.TO':   'BCE Inc',
-    '^GSPTSE':  'TSX Composite Index',
-    'CAD=X':    'CAD/USD Exchange Rate'
-}
-
-def get_snowflake_connection():
-    return snowflake.connector.connect(
-        account=os.getenv('SNOWFLAKE_ACCOUNT'),
-        user=os.getenv('SNOWFLAKE_USER'),
-        password=os.getenv('SNOWFLAKE_PASSWORD'),
-        database=os.getenv('SNOWFLAKE_DATABASE'),
-        schema=os.getenv('SNOWFLAKE_SCHEMA'),
-        warehouse=os.getenv('SNOWFLAKE_WAREHOUSE')
-    )
+# TSX tickers relevant to Canadian wealth management
+TICKERS = [
+    ("RY.TO",   "Royal Bank of Canada"),
+    ("TD.TO",   "TD Bank"),
+    ("BNS.TO",  "Bank of Nova Scotia"),
+    ("BMO.TO",  "Bank of Montreal"),
+    ("CM.TO",   "CIBC"),
+    ("SU.TO",   "Suncor Energy"),
+    ("CNQ.TO",  "Canadian Natural Resources"),
+    ("ENB.TO",  "Enbridge"),
+    ("TRP.TO",  "TC Energy"),
+    ("SHOP.TO", "Shopify"),
+    ("CP.TO",   "Canadian Pacific Railway"),
+    ("CNR.TO",  "Canadian National Railway"),
+    ("BAM.TO",  "Brookfield Asset Management"),
+    ("MFC.TO",  "Manulife Financial"),
+    ("SLF.TO",  "Sun Life Financial"),
+    ("BCE.TO",  "BCE Inc"),
+    ("T.TO",    "TELUS"),
+    ("NTR.TO",  "Nutrien"),
+    ("ABX.TO",  "Barrick Gold"),
+    ("WPM.TO",  "Wheaton Precious Metals"),
+]
 
 def fetch_and_store_prices():
-    print("📈 Fetching market prices from Yahoo Finance...\n")
+    print("Fetching market prices from Yahoo Finance...")
+    today   = date.today().isoformat()
+    saved   = 0
+    skipped = 0
+    errors  = 0
 
-    conn   = get_snowflake_connection()
-    cursor = conn.cursor()
-
-    success_count = 0
-
-    for ticker, company_name in TICKERS.items():
+    for ticker, company_name in TICKERS:
         try:
-            stock = yf.Ticker(ticker)
-            info  = stock.info
-
-            price      = info.get('currentPrice') or info.get('regularMarketPrice') or 0
-            change_pct = info.get('regularMarketChangePercent') or 0
-            volume     = info.get('regularMarketVolume') or 0
-            market_cap = info.get('marketCap') or 0
-            price_date = date.today()
-            price_id   = str(uuid.uuid4())
-
-            # ── Check if ticker + date already exists ──────────────
+            # Check if already fetched today
+            conn   = get_connection()
+            cursor = conn.cursor()
             cursor.execute("""
                 SELECT COUNT(*) FROM MARKET_PRICES
-                WHERE TICKER = %s AND PRICE_DATE = %s
-            """, (ticker, price_date))
+                WHERE TICKER = ? AND PRICE_DATE = ?
+            """, (ticker, today))
+            exists = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
 
-            if cursor.fetchone()[0] == 0:
-                cursor.execute("""
-                    INSERT INTO MARKET_PRICES
-                        (ID, TICKER, COMPANY_NAME, PRICE, CHANGE_PCT, VOLUME, MARKET_CAP, PRICE_DATE)
-                    VALUES
-                        (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (price_id, ticker, company_name, price, change_pct, volume, market_cap, price_date))
-                arrow = "🟢" if change_pct >= 0 else "🔴"
-                print(f"  {arrow} {company_name:45s} ${price:.2f}  ({change_pct:+.2f}%)")
-                success_count += 1
+            if exists:
+                skipped += 1
+                continue
+
+            # Fetch from Yahoo Finance
+            stock = yf.Ticker(ticker)
+            hist  = stock.history(period="2d")
+
+            if hist.empty:
+                print(f"   No data for {ticker}")
+                errors += 1
+                continue
+
+            latest     = hist.iloc[-1]
+            price      = round(float(latest['Close']), 2)
+            volume     = float(latest['Volume'])
+
+            # Calculate change percentage
+            if len(hist) >= 2:
+                prev_close = float(hist.iloc[-2]['Close'])
+                change_pct = round(
+                    ((price - prev_close) / prev_close) * 100, 2
+                )
             else:
-                print(f"  ⏭️  Skipped (already exists): {company_name}")
+                change_pct = 0.0
+
+            run_execute("""
+                INSERT INTO MARKET_PRICES
+                    (ID, TICKER, COMPANY_NAME, PRICE,
+                     CHANGE_PCT, VOLUME, PRICE_DATE)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(uuid.uuid4()),
+                ticker,
+                company_name,
+                price,
+                change_pct,
+                volume,
+                today
+            ))
+            saved += 1
+            arrow = "▲" if change_pct >= 0 else "▼"
+            print(
+                f"   {arrow} {company_name[:35]:35s} "
+                f"${price:.2f} ({change_pct:+.2f}%)"
+            )
 
         except Exception as e:
-            print(f"  ❌ Failed for {ticker}: {str(e)}")
+            print(f"   Error fetching {ticker}: {e}")
+            errors += 1
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"\n🎉 Done! {success_count} stored, rest skipped.")
+    print(f"\n   Market prices: {saved} saved, "
+          f"{skipped} skipped, {errors} errors")
+    return saved
 
 if __name__ == "__main__":
     fetch_and_store_prices()

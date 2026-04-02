@@ -1,96 +1,84 @@
+# ── fetch_boc_rates.py — SQLite version ──────────────────────────
 import requests
-import snowflake.connector
-from dotenv import load_dotenv
-import os
-from datetime import datetime
 import uuid
-
-load_dotenv()
-
-# ── Bank of Canada series codes we want ───────────────────────────
+from datetime import datetime
+from db import get_connection, run_execute
 BOC_SERIES = {
-    'FXCADUSD':  'CAD/USD Exchange Rate',
-    'AVG.INTWO': 'Overnight Money Market Rate',
-    'V122530':   'Bank of Canada Overnight Rate',
-    'V122495':   'Prime Rate',
-    'V122508':   '3 Month Treasury Bill Rate',
-    'V122518':   '10 Year Government Bond Yield',
+    "V122530":  "Bank of Canada Overnight Rate",
+    "V122514":  "Prime Rate",
+    "V39055":   "Canada 3-Month Treasury Bill",
+    "V39056":   "Canada 6-Month Treasury Bill",
+    "V39057":   "Canada 1-Year Treasury Bill",
+    "V39058":   "Canada 2-Year Government Bond",
+    "V39062":   "Canada 10-Year Government Bond",
 }
 
-BOC_BASE_URL = "https://www.bankofcanada.ca/valet"
-
-def get_snowflake_connection():
-    return snowflake.connector.connect(
-        account=os.getenv('SNOWFLAKE_ACCOUNT'),
-        user=os.getenv('SNOWFLAKE_USER'),
-        password=os.getenv('SNOWFLAKE_PASSWORD'),
-        database=os.getenv('SNOWFLAKE_DATABASE'),
-        schema=os.getenv('SNOWFLAKE_SCHEMA'),
-        warehouse=os.getenv('SNOWFLAKE_WAREHOUSE')
-    )
-
-def fetch_series(series_code):
-    """Fetch latest value for a single BOC series"""
-    url = f"{BOC_BASE_URL}/observations/{series_code}/json?recent=1"
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-
-    observations = data.get('observations', [])
-    if not observations:
-        return None, None
-
-    latest     = observations[-1]
-    rate_date  = latest.get('d')
-    rate_value = latest.get(series_code, {}).get('v')
-
-    return rate_date, float(rate_value) if rate_value else None
-
 def fetch_and_store_rates():
-    print("🏦 Fetching rates from Bank of Canada API...\n")
-
-    conn   = get_snowflake_connection()
-    cursor = conn.cursor()
-
-    success_count = 0
+    print("Fetching Bank of Canada rates...")
+    saved   = 0
+    skipped = 0
 
     for series_code, series_name in BOC_SERIES.items():
         try:
-            rate_date, rate_value = fetch_series(series_code)
+            url      = (
+                f"https://www.bankofcanada.ca/valet/observations"
+                f"/{series_code}/json?recent=1"
+            )
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            data     = response.json()
 
-            if rate_value is None:
-                print(f"  ⚠️  No data for {series_name}")
+            observations = data.get('observations', [])
+            if not observations:
+                print(f"   No data for {series_code}")
                 continue
 
-            rate_id     = str(uuid.uuid4())
-            parsed_date = datetime.strptime(rate_date, '%Y-%m-%d').date()
+            latest    = observations[-1]
+            rate_date = latest.get('d', '')
+            rate_val  = latest.get(series_code, {}).get('v')
 
-            # ── Check if rate for this series + date already exists ─
+            if rate_val is None:
+                print(f"   No value for {series_code}")
+                continue
+
+            rate_value = float(rate_val)
+
+            # Check for duplicate
+            conn   = get_connection()
+            cursor = conn.cursor()
             cursor.execute("""
                 SELECT COUNT(*) FROM BOC_RATES
-                WHERE SERIES_CODE = %s AND RATE_DATE = %s
-            """, (series_code, parsed_date))
+                WHERE SERIES_CODE = ? AND RATE_DATE = ?
+            """, (series_code, rate_date))
+            exists = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
 
-            if cursor.fetchone()[0] == 0:
-                cursor.execute("""
-                    INSERT INTO BOC_RATES
-                        (ID, SERIES_NAME, SERIES_CODE, RATE_VALUE, RATE_DATE)
-                    VALUES
-                        (%s, %s, %s, %s, %s)
-                """, (rate_id, series_name, series_code, rate_value, parsed_date))
-                print(f"  ✅ {series_name:45s} {rate_value:.4f}  ({rate_date})")
-                success_count += 1
-            else:
-                print(f"  ⏭️  Skipped (already exists): {series_name}")
+            if exists:
+                skipped += 1
+                print(f"   Skipped (exists): {series_name}")
+                continue
+
+            run_execute("""
+                INSERT INTO BOC_RATES
+                    (ID, SERIES_CODE, SERIES_NAME,
+                     RATE_VALUE, RATE_DATE)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                str(uuid.uuid4()),
+                series_code,
+                series_name,
+                rate_value,
+                rate_date
+            ))
+            saved += 1
+            print(f"   Saved: {series_name} = {rate_value}% ({rate_date})")
 
         except Exception as e:
-            print(f"  ❌ Failed for {series_name}: {str(e)}")
+            print(f"   Error fetching {series_code}: {e}")
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"\n🎉 Done! {success_count} stored, rest skipped.")
+    print(f"   BoC rates: {saved} saved, {skipped} skipped")
+    return saved
 
 if __name__ == "__main__":
     fetch_and_store_rates()
