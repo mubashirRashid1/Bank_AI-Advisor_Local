@@ -7,7 +7,7 @@ import uuid
 import os
 from db import get_connection, run_cortex, semantic_search_chroma
 
-today = date.today().isoformat()
+#today = date.today().isoformat()
 
 # ── Agent State ───────────────────────────────────────────────────
 class AdvisorState(TypedDict):
@@ -53,6 +53,12 @@ def get_financial_embeddings():
             "energy oil gold commodity currency trading",
             "dividend earnings revenue profit growth GDP",
             "hedge fund insurance pension endowment derivatives",
+            # ── ADD THESE ────────────────────────────────────────────────
+            "which clients should I call today based on market news",
+            "who to contact first given portfolio exposure and risk",
+            "advisor morning briefing client priority call list",
+            "market conditions impact on client portfolios today",
+            "portfolio manager briefing sector movements client risk",
         ]
 
         _financial_embeddings = np.array([
@@ -82,7 +88,7 @@ def is_financial_question(question: str) -> tuple:
         )
         similarities = fin_norm @ q_norm
         score        = float(np.max(similarities))
-        return score > 0.25, round(score, 3)
+        return score > 0.20, round(score, 3)
 
     except Exception:
         # Embedding failed — default to allow
@@ -99,15 +105,24 @@ def router_node(state: AdvisorState) -> AdvisorState:
     # Any message after a financial conversation is a follow-up.
     # Handles: typos, "is that correct?", vague references,
     # confirmations — no keyword list needed.
+
     if len(history) > 0:
         state['reasoning_log'].append(
             "🔄 **Router** — Conversation in progress. "
             "Treating as follow-up."
         )
-        state['tools_needed']    = ['search_news']
-        state['search_attempts'] = 0
+        # Manager mode — keep client data tool for follow-ups
+        # so client context is not lost between turns
+        if state['query_type'] == 'manager':
+            state['tools_needed'] = [
+                'search_news', 'get_mgr_clients',
+                'get_rates', 'get_prices'
+            ]
+        else:
+            state['tools_needed'] = [
+                'search_news', 'get_rates', 'get_prices'
+            ]
         return state
-
     # ── First question — semantic scope check ─────────────────────
     is_financial, score = is_financial_question(question)
 
@@ -193,10 +208,21 @@ def search_news_node(state: AdvisorState) -> AdvisorState:
             for kw in REGULATORY_KEYWORDS
         )
 
-        # ── Always check ChromaDB first ───────────────────────────
+
+# ── Always check ChromaDB first ───────────────────────────
         articles   = semantic_search_chroma(search_query, limit=8)
         MINIMUM    = 3
         has_enough = len(articles) >= MINIMUM
+
+        # ── Force whitelist for regulatory queries ─────────────────
+        # Even if ChromaDB has enough articles, regulatory queries
+        # (CIRO, OSFI etc) need authoritative live sources not cache
+        if force_whitelist and has_enough:
+            state['reasoning_log'].append(
+                f"   ℹ️ ChromaDB has {len(articles)} articles but "
+                f"regulatory query — forcing authoritative sources..."
+            )
+            has_enough = False
 
         if has_enough:
             state['reasoning_log'].append(
@@ -206,15 +232,14 @@ def search_news_node(state: AdvisorState) -> AdvisorState:
         else:
             if force_whitelist:
                 state['reasoning_log'].append(
-                    "🏛️ **Regulatory Query** — Local insufficient. "
-                    "Searching authoritative sources..."
+                    "🏛️ **Regulatory Query** — Searching "
+                    "authoritative sources..."
                 )
             else:
                 state['reasoning_log'].append(
                     f"   ℹ️ ChromaDB returned {len(articles)} "
                     f"(need {MINIMUM}) — trying whitelist..."
                 )
-
         # ── Whitelist if needed ───────────────────────────────────
         if not has_enough:
             tavily_key = os.getenv('TAVILY_API_KEY')
@@ -245,7 +270,7 @@ def search_news_node(state: AdvisorState) -> AdvisorState:
                     if raw_articles:
                         articles = [{
                             'TITLE':          str(a.get('title',  '') or ''),
-                            'SUMMARY':        str(a.get('content','') or '')[:300],
+                            'SUMMARY':        str(a.get('content','') or '')[:800],
                             'SENTIMENT':      'NEUTRAL',
                             'SOURCE':         (
                                 a.get('url','').split('/')[2]
@@ -373,6 +398,39 @@ def search_news_node(state: AdvisorState) -> AdvisorState:
                 state['reasoning_log'].append(
                     "   ⚠️ TAVILY_API_KEY not set"
                 )
+                # At the end of search_news_node
+# After: articles = semantic_search_chroma(...)
+# ADD THIS to enrich with full SQLite content:
+
+        if articles:
+            try:
+                conn   = get_connection()
+                cursor = conn.cursor()
+                enriched = []
+                for a in articles:
+                    title = a.get('TITLE', a.get('title',''))
+                    if title:
+                        cursor.execute("""
+                            SELECT r.CONTENT, e.SUMMARY
+                            FROM NEWS_RAW r
+                            JOIN NEWS_ENRICHED e
+                            ON r.ID = e.NEWS_RAW_ID
+                            WHERE r.TITLE = ?
+                            LIMIT 1
+                        """, (title,))
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            # Use full content from SQLite
+                            a['SUMMARY'] = str(row[0])[:800]
+                    enriched.append(a)
+                cursor.close()
+                conn.close()
+                articles = enriched
+                state['reasoning_log'].append(
+                    "   📄 Enriched articles with full SQLite content"
+                )
+            except Exception:
+                pass  # Fall back to ChromaDB summaries
 
         state['news_articles']    = articles
         state['search_attempts'] += 1
@@ -462,6 +520,9 @@ def get_rates_node(state: AdvisorState) -> AdvisorState:
 # NODE 5 — GET PRICES
 # ─────────────────────────────────────────────────────────────────
 def get_prices_node(state: AdvisorState) -> AdvisorState:
+    
+    from datetime import date
+    today = date.today().isoformat()  # ← fresh each call
     state['reasoning_log'].append(
         "📈 **Get Prices** — Market prices..."
     )
@@ -535,18 +596,34 @@ def answer_node(state: AdvisorState) -> AdvisorState:
         return state
 
     # Build context strings
-    holdings_text = "\n".join([
-        f"- {r['SECURITY_NAME']} ({r['ASSET_CLASS']} | "
-        f"{r['SECTOR']}): ${r['CURRENT_VALUE']:,.0f} | "
-        f"P&L: ${r['UNREALIZED_PNL']:,.0f} | "
-        f"Weight: {r['WEIGHT_PCT']:.1f}%"
-        for r in state['holdings']
-    ]) if state['holdings'] else "No holdings"
-
+    # REPLACE WITH THIS
+    if state['query_type'] == 'manager' and state['holdings']:
+        # Manager mode — holdings contains top client summaries
+        holdings_text = "\n".join([
+            f"- {r.get('CUSTOMER_NAME','Unknown')} | "
+            f"{r.get('SEGMENT','')} | "
+            f"Risk: {r.get('RISK_PROFILE','')} | "
+            f"AUM: ${r.get('TOTAL_AUM',0):,.0f} | "
+            f"Portfolio: ${r.get('PORTFOLIO_VALUE',0):,.0f} | "
+            f"P&L: ${r.get('TOTAL_PNL',0):+,.0f} | "
+            f"Sectors: {r.get('SECTORS','')[:60]} | "
+            f"City: {r.get('CITY','')}"
+            for r in state['holdings']
+        ])
+    else:
+        # Advisor mode — individual holdings
+        holdings_text = "\n".join([
+            f"- {r['SECURITY_NAME']} ({r['ASSET_CLASS']} | "
+            f"{r['SECTOR']}): ${r['CURRENT_VALUE']:,.0f} | "
+            f"P&L: ${r['UNREALIZED_PNL']:,.0f} | "
+            f"Weight: {r['WEIGHT_PCT']:.1f}%"
+            for r in state['holdings']
+        ]) if state['holdings'] else "No holdings"
+        
     news_text = "\n".join([
         f"- [{r.get('SENTIMENT', r.get('sentiment', 'N/A'))}] "
         f"{r.get('TITLE', r.get('title', ''))} — "
-        f"{str(r.get('SUMMARY', r.get('summary', '')))[:200]}"
+        f"{str(r.get('SUMMARY', r.get('summary', '')))[:500]}"
         for r in state['news_articles']
     ]) if state['news_articles'] else "No news found"
 
@@ -567,7 +644,7 @@ def answer_node(state: AdvisorState) -> AdvisorState:
         history_text = "\n\nCONVERSATION HISTORY:\n"
         for turn in state['conversation_history'][-6:]:
             role    = "Advisor" if turn['role'] == 'user' else "AI"
-            content = str(turn.get('content', ''))[:300]
+            content = str(turn.get('content', ''))[:2000]
             history_text += f"{role}: {content}\n\n"
 
     # Follow-up detection — semantic similarity to conversation
@@ -603,47 +680,81 @@ def answer_node(state: AdvisorState) -> AdvisorState:
             # Default: if history exists → treat as follow-up
             is_followup = has_history
 
-    # Build prompt
+        # Build prompt
     if is_followup:
         prompt = (
             "You are a senior Canadian wealth management AI advisor. "
-            "Answer the follow-up question using ONLY the information "
-            "provided below and in the conversation history. "
+            "Answer the follow-up using the conversation history "
+            "and the data provided below. "
+            "IMPORTANT: The conversation history contains client names, "
+            "AUM figures, sectors and P&L from the previous response. "
+            "Use those details directly — do NOT say you lack client data "
+            "if it appears in the conversation history above. "
             "Do NOT use any knowledge from your training. "
-            "Do NOT invent facts, dates, rule names, or policy details. "
-            "If the specific information requested is not in the "
-            "provided context, say clearly: "
-            "'I don't have specific data on that in my current sources. "
-            "Please run a fresh search or check the regulator directly.' "
+            "Do NOT invent facts not present in the data or history. "
             "Write in plain conversational prose only. "
             "No headers, no numbered sections. "
             "Keep to 2-4 paragraphs."
             + history_text +
             "\n\nFOLLOW-UP QUESTION: " + state['question'] +
-            "\n\nAVAILABLE NEWS CONTEXT:\n" + news_text +
+            "\n\nCLIENT DATA (same clients as previous response):\n"
+            + holdings_text +
+            "\n\nNEWS CONTEXT:\n" + news_text +
             "\n\nRATE CONTEXT:\n" + rates_text +
-            "\n\nHOLDINGS CONTEXT:\n" + holdings_text +
-            "\n\nIMPORTANT: Only use the above data. "
-            "If the answer is not in the data above, say so honestly."
+            "\n\nINSTRUCTION: If the user asks about a specific client "
+            "mentioned in the conversation history, use the details "
+            "from that history to answer. Do not say data is unavailable "
+            "if it is present in the conversation history above."
         )
     elif state['query_type'] == 'manager':
-        prompt = (
-            "You are a senior Canadian wealth management AI advisor "
-            "briefing a portfolio manager. "
-            "Answer using ONLY the data provided. "
-            "Be specific and cite actual numbers. "
-            "Do not reference any individual customer. "
-            "Write in plain paragraphs only. "
-            "Do NOT use headers, numbered sections or bullets. "
-            "Cover: market situation, key risks, sectors affected, "
-            "advisor actions, and urgency. "
-            "Keep to 4-6 paragraphs maximum."
-            + history_text +
-            "\n\nQUESTION: "             + state['question'] +
-            "\n\nLATEST NEWS:\n"         + news_text +
-            "\n\nBANK OF CANADA RATES:\n"+ rates_text +
-            "\n\nMARKET PRICES:\n"       + prices_text
-        )
+
+        # ── Client data available → recommend who to call ─────────
+        if state['holdings']:
+            prompt = (
+                "You are a senior Canadian wealth management AI advisor "
+                "briefing a portfolio manager. "
+                "Answer using ONLY the data provided below. "
+                "Be specific — use REAL CLIENT NAMES from the data. "
+                "Cite actual AUM figures and portfolio values. "
+                "Do not invent any client names, numbers or sectors. "
+                "Write in plain paragraphs only. "
+                "No headers, no numbered sections, no bullets. "
+                "Keep to 4-6 paragraphs maximum."
+                + history_text +
+                "\n\nQUESTION: " + state['question'] +
+                "\n\nTOP CLIENTS BY AUM:\n" + holdings_text +
+                "\n\nLATEST NEWS:\n"          + news_text +
+                "\n\nBANK OF CANADA RATES:\n" + rates_text +
+                "\n\nMARKET PRICES:\n"        + prices_text +
+                "\n\nINSTRUCTION: Recommend specific clients by name "
+                "from the list above and explain WHY based on their "
+                "sectors and today's news. Do not invent names or numbers."
+            )
+
+        # ── No client data → pure market/regulatory briefing ──────
+        else:
+            prompt = (
+                "You are a senior Canadian wealth management AI advisor "
+                "briefing a portfolio manager. "
+                "Answer the question using ONLY the information provided. "
+                "Do NOT mention missing client data or ask for it. "
+                "Focus entirely on answering the regulatory or market "
+                "question with the news and data available. "
+                "Be specific — cite actual guideline names, dates, "
+                "and requirements from the news context. "
+                "Write in plain paragraphs only. "
+                "No headers, no numbered sections, no bullets. "
+                "Keep to 3-5 paragraphs."
+                + history_text +
+                "\n\nQUESTION: " + state['question'] +
+                "\n\nLATEST NEWS AND REGULATORY GUIDANCE:\n" + news_text +
+                "\n\nBANK OF CANADA RATES:\n" + rates_text +
+                "\n\nMARKET PRICES:\n"        + prices_text +
+                "\n\nINSTRUCTION: Answer the question directly. "
+                "Do not mention missing client data. "
+                "If specific details are not in the provided context "
+                "say so clearly and direct to the source."
+            )        
     else:
         prompt = (
             "You are a senior Canadian wealth management AI advisor. "
@@ -700,13 +811,14 @@ def should_skip_to_answer(state: AdvisorState) -> str:
 def build_agent():
     graph = StateGraph(AdvisorState)
 
-    graph.add_node("router",       router_node)
-    graph.add_node("search_news",  search_news_node)
-    graph.add_node("get_holdings", get_holdings_node)
-    graph.add_node("get_rates",    get_rates_node)
-    graph.add_node("get_prices",   get_prices_node)
-    graph.add_node("evaluate",     evaluate_node)
-    graph.add_node("answer",       answer_node)
+    graph.add_node("router",          router_node)
+    graph.add_node("search_news",     search_news_node)
+    graph.add_node("get_holdings",    get_holdings_node)
+    graph.add_node("get_mgr_clients", get_manager_clients_node)  # ← NEW
+    graph.add_node("get_rates",       get_rates_node)
+    graph.add_node("get_prices",      get_prices_node)
+    graph.add_node("evaluate",        evaluate_node)
+    graph.add_node("answer",          answer_node)
 
     graph.set_entry_point("router")
 
@@ -716,10 +828,11 @@ def build_agent():
         {"answer": "answer", "search_news": "search_news"}
     )
 
-    graph.add_edge("search_news",  "get_holdings")
-    graph.add_edge("get_holdings", "get_rates")
-    graph.add_edge("get_rates",    "get_prices")
-    graph.add_edge("get_prices",   "evaluate")
+    graph.add_edge("search_news",     "get_holdings")
+    graph.add_edge("get_holdings",    "get_mgr_clients")  # ← NEW
+    graph.add_edge("get_mgr_clients", "get_rates")        # ← UPDATED
+    graph.add_edge("get_rates",       "get_prices")
+    graph.add_edge("get_prices",      "evaluate")
 
     graph.add_conditional_edges(
         "evaluate",
@@ -733,9 +846,23 @@ def build_agent():
 # ─────────────────────────────────────────────────────────────────
 # AUDIT LOG
 # ─────────────────────────────────────────────────────────────────
-def log_to_snowflake(state, advisor_name, conn=None):
+def log_to_db(state, advisor_name, conn=None):
     from db import run_execute
     try:
+        # ── Detect if this was a follow-up ────────────────────────
+        is_followup = 0
+        for log_entry in state.get('reasoning_log', []):
+            if 'follow-up' in log_entry.lower() or \
+               'conversation in progress' in log_entry.lower():
+                is_followup = 1
+                break
+
+        # ── Calculate turn number ─────────────────────────────────
+        turn_number = len(state.get('conversation_history', [])) // 2 + 1
+        # Each turn = 1 user + 1 assistant message
+        # So history length / 2 = previous turns
+        # +1 = current turn
+
         run_execute("""
             INSERT INTO AI_AUDIT_LOG (
                 AUDIT_ID, ADVISOR_NAME, CUSTOMER_NAME,
@@ -743,8 +870,9 @@ def log_to_snowflake(state, advisor_name, conn=None):
                 SEARCH_ATTEMPTS, NEWS_TITLES,
                 HOLDINGS_TICKERS, RATES_USED, PRICES_USED,
                 MODEL_USED, AI_RESPONSE, REASONING_LOG,
-                NEWS_COUNT, HOLDINGS_COUNT
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                NEWS_COUNT, HOLDINGS_COUNT,
+                IS_FOLLOWUP, THREAD_ID, TURN_NUMBER
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             str(uuid.uuid4()),
             str(advisor_name or ''),
@@ -767,11 +895,13 @@ def log_to_snowflake(state, advisor_name, conn=None):
             str(state.get('final_response', '') or ''),
             json.dumps(state.get('reasoning_log', [])),
             len(state.get('news_articles', [])),
-            len(state.get('holdings',      []))
+            len(state.get('holdings',      [])),
+            is_followup,                          # ← NEW
+            str(state.get('thread_id', '') or ''),# ← NEW
+            turn_number                           # ← NEW
         ))
     except Exception as e:
         print(f"Audit log failed: {e}")
-
 # ─────────────────────────────────────────────────────────────────
 # PUBLIC FUNCTION
 # ─────────────────────────────────────────────────────────────────
@@ -809,7 +939,7 @@ def run_advisor_agent(
         )
 
         try:
-            log_to_snowflake(result, advisor_name)
+            log_to_db(result, advisor_name)
         except Exception as e:
             print(f"Audit log error: {e}")
 
@@ -826,3 +956,82 @@ def run_advisor_agent(
         }
 
     return result
+
+def get_manager_clients_node(state: AdvisorState) -> AdvisorState:
+    """
+    For manager mode — load top clients by AUM with
+    their portfolio summary so agent can recommend
+    who to call with real names and real numbers.
+    """
+    if state['query_type'] != 'manager':
+        return state
+
+    # Only run if question is about clients/who to call
+
+    has_history = len(state['conversation_history']) > 0
+
+    if not has_history:
+        # Fresh question — check keywords
+        client_keywords = [
+            'who to call', 'which client', 'which clients',
+            'who should i call', 'who do i call',
+            'client exposure', 'client risk', 'client portfolio',
+            'call today', 'call first', 'prioritize',
+            'rebalance', 'contact client', 'reach out'
+        ]
+        question_lower = state['question'].lower()
+        needs_clients  = any(
+            kw in question_lower for kw in client_keywords
+        )
+        if not needs_clients:
+            return state
+    # If has_history → always load clients
+    # follow-up may reference any client by name
+    state['reasoning_log'].append(
+        "👥 **Manager Clients** — Loading top clients by AUM..."
+    )
+
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT
+                c.CUSTOMER_NAME,
+                c.SEGMENT,
+                c.RISK_PROFILE,
+                c.TOTAL_AUM,
+                c.RELATIONSHIP_MANAGER,
+                c.CITY,
+                COUNT(h.HOLDING_ID)      AS TOTAL_HOLDINGS,
+                SUM(h.CURRENT_VALUE)     AS PORTFOLIO_VALUE,
+                SUM(h.UNREALIZED_PNL)    AS TOTAL_PNL,
+                GROUP_CONCAT(
+                    DISTINCT h.ASSET_CLASS
+                )                        AS ASSET_CLASSES,
+                GROUP_CONCAT(
+                    DISTINCT h.SECTOR
+                )                        AS SECTORS
+            FROM CUSTOMERS c
+            JOIN PORTFOLIOS p ON c.CUSTOMER_ID = p.CUSTOMER_ID
+            JOIN HOLDINGS h   ON p.PORTFOLIO_ID = h.PORTFOLIO_ID
+            GROUP BY c.CUSTOMER_ID
+            ORDER BY c.TOTAL_AUM DESC
+            LIMIT 10
+        """)
+        columns = [d[0] for d in cursor.description]
+        rows    = cursor.fetchall()
+        clients = [dict(zip(columns, r)) for r in rows]
+
+        state['holdings'] = clients
+        state['reasoning_log'].append(
+            f"   ✅ Loaded **{len(clients)} top clients** "
+            f"with portfolio context"
+        )
+    except Exception as e:
+        state['reasoning_log'].append(
+            f"   ⚠️ Client load failed: {str(e)[:80]}"
+        )
+    finally:
+        cursor.close()
+        conn.close()
+    return state

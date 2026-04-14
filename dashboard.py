@@ -64,12 +64,13 @@ def cached_query(query, params=None):
     return run_query(query, params)
 
 # ── Models Available (local Ollama) ───────────────────────────────
+# REPLACE WITH THIS
 MODELS = {
-    "Llama 3.2 1B — Lightweight Fast":  "llama3.2:1b",  # ← move to top
-    "Mistral — General Purpose":        "mistral",
-    "Llama 3.1 8B — Balanced":          "llama3.1:8b",
-    "DeepSeek R1 — Reasoning":          "deepseek-r1:7b",
-    "Phi3 (Microsoft) — Fast":          "phi3",
+    "Claude Haiku — Fast & Smart":      "claude-haiku-4-5-20251001",
+    "Claude Sonnet — Balanced":         "claude-sonnet-4-6",
+    "Llama 3.2 1B — Local Lightweight": "llama3.2:1b",
+    "Mistral — Local General Purpose":  "mistral",
+    "Llama 3.1 8B — Local Balanced":    "llama3.1:8b",
 }
 
 # ── Semantic Search with ChromaDB ────────────────────────────────
@@ -1442,7 +1443,16 @@ with tab6:
                 label_visibility="collapsed"
             )
             agent_model = MODELS[agent_model_label]
-            st.caption("🏠 Running locally via Ollama")
+#            st.caption("🏠 Running locally via Ollama")
+            selected_model_name = list(MODELS.keys())[0]  # just for reference
+            current_model = MODELS.get(
+                st.session_state.get("tab5_model", ""),
+                OLLAMA_MODEL
+            )
+            if current_model.startswith("claude"):
+                st.caption("☁️ Anthropic API — data sent to Anthropic")
+            else:
+                st.caption("🏠 Running locally via Ollama — zero data transit")            
 
             st.markdown("---")
 

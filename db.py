@@ -61,21 +61,45 @@ def run_execute(query, params=None):
 
 # ── Ollama AI Inference — uses REST API directly ──────────────────
 def run_cortex(prompt, model=None):
-    """Call local Ollama via HTTP REST."""
+    """
+    Route to Anthropic API or Ollama based on model name.
+    Claude models → Anthropic API
+    All others    → local Ollama
+    """
     model = model or OLLAMA_MODEL
+
+    # ── Anthropic Claude models ───────────────────────────────────
+    if model.startswith("claude"):
+        try:
+            import anthropic
+            api_key = os.getenv('ANTHROPIC_API_KEY')
+            if not api_key:
+                raise Exception(
+                    "ANTHROPIC_API_KEY not set in .env"
+                )
+            client  = anthropic.Anthropic(api_key=api_key)
+            message = client.messages.create(
+                model      = model,
+                max_tokens = 1024,
+                messages   = [{"role":"user","content":prompt}]
+            )
+            return message.content[0].text
+        except Exception as e:
+            raise Exception(f"Anthropic API failed: {e}")
+
+    # ── Local Ollama models ───────────────────────────────────────
     try:
         response = requests.post(
             f"{OLLAMA_URL}/api/chat",
             json={
                 "model":    model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role":"user","content":prompt}],
                 "stream":   False
             },
-            timeout=300   # ← increase from 120 to 300 seconds
+            timeout=300
         )
         response.raise_for_status()
-        data = response.json()
-
+        data    = response.json()
         message = data.get("message")
         if message is None:
             raise Exception(f"No message in response: {data}")
@@ -83,19 +107,16 @@ def run_cortex(prompt, model=None):
         if content is None:
             raise Exception(f"No content in message: {message}")
         return str(content)
-
     except requests.exceptions.ConnectionError:
         raise Exception(
             "Ollama is not running. Start with: ollama serve"
         )
     except requests.exceptions.Timeout:
         raise Exception(
-            "Ollama timed out. The model is taking too long. "
-            "Try switching to llama3.2:1b in .env"
+            "Ollama timed out. Try switching to llama3.2:1b"
         )
     except Exception as e:
         raise Exception(f"Ollama inference failed: {e}")
-
 # ── Embedding Generation ──────────────────────────────────────────
 _embedding_model = None
 
