@@ -8,7 +8,7 @@
 
 This is a Proof of Concept AI-powered advisory application built for the financial services industry. It demonstrates how modern AI technologies — Retrieval Augmented Generation (RAG), vector embeddings, agentic workflows, and local LLMs — can be combined into a production-ready architecture that runs entirely on a personal Windows laptop with no cloud dependency.
 
-**Originally built for a Global Asset Management Group POC.** The architecture is domain-agnostic and can be adapted to any enterprise use case.
+ The architecture is domain-agnostic and can be adapted to any enterprise use case.
 
 ---
 
